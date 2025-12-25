@@ -1,0 +1,384 @@
+"""
+steady_state.py - Solutore per il caso stazionario
+
+Risolve l'equazione del calore stazionaria:
+∇·(k∇T) + Q = 0
+
+con appropriate condizioni al contorno.
+"""
+
+import numpy as np
+from scipy import sparse
+from scipy.sparse import linalg as splinalg
+from typing import Optional, Tuple, Dict, Any
+from dataclasses import dataclass
+import time
+
+from ..core.mesh import Mesh3D
+from .matrix_builder import build_steady_state_matrix
+
+
+@dataclass
+class SolverConfig:
+    """Configurazione del solutore"""
+    method: str = "direct"          # "direct", "cg", "gmres", "bicgstab"
+    tolerance: float = 1e-8         # Tolleranza per metodi iterativi
+    max_iterations: int = 10000     # Max iterazioni
+    preconditioner: str = "ilu"     # "none", "jacobi", "ilu"
+    verbose: bool = True            # Stampa info
+
+
+@dataclass
+class SolverResult:
+    """Risultato della soluzione"""
+    T: np.ndarray                   # Campo di temperatura
+    converged: bool                 # Convergenza raggiunta
+    iterations: int                 # Numero di iterazioni
+    residual: float                 # Residuo finale
+    solve_time: float               # Tempo di soluzione [s]
+    info: Dict[str, Any]            # Info aggiuntive
+
+
+class SteadyStateSolver:
+    """
+    Solutore per l'equazione del calore stazionaria.
+    
+    Supporta metodi diretti e iterativi con precondizionamento.
+    """
+    
+    def __init__(self, mesh: Mesh3D, config: Optional[SolverConfig] = None):
+        """
+        Inizializza il solutore.
+        
+        Args:
+            mesh: Mesh3D con geometria e condizioni al contorno
+            config: Configurazione del solutore
+        """
+        self.mesh = mesh
+        self.config = config if config is not None else SolverConfig()
+        
+        # Matrice e RHS (costruiti al primo solve)
+        self._A: Optional[sparse.csr_matrix] = None
+        self._b: Optional[np.ndarray] = None
+        self._preconditioner = None
+        
+    def build_system(self):
+        """Costruisce il sistema lineare A*T = b"""
+        if self.config.verbose:
+            print("Costruzione sistema lineare...")
+        
+        t_start = time.time()
+        self._A, self._b = build_steady_state_matrix(self.mesh)
+        t_build = time.time() - t_start
+        
+        if self.config.verbose:
+            print(f"  Tempo costruzione: {t_build:.2f} s")
+            print(f"  Dimensione: {self._A.shape[0]} x {self._A.shape[1]}")
+            print(f"  Non-zero: {self._A.nnz} ({100*self._A.nnz/self._A.shape[0]**2:.3f}%)")
+    
+    def solve(self, rebuild: bool = False) -> SolverResult:
+        """
+        Risolve il sistema.
+        
+        Args:
+            rebuild: Se True, ricostruisce la matrice anche se esiste
+            
+        Returns:
+            SolverResult con temperatura e info
+        """
+        # Costruisci sistema se necessario
+        if self._A is None or rebuild:
+            self.build_system()
+        
+        if self.config.verbose:
+            print(f"Risoluzione con metodo: {self.config.method}")
+        
+        t_start = time.time()
+        
+        if self.config.method == "direct":
+            result = self._solve_direct()
+        else:
+            result = self._solve_iterative()
+        
+        t_solve = time.time() - t_start
+        result.solve_time = t_solve
+        
+        # Aggiorna la mesh con la soluzione
+        self.mesh.T = self.mesh.unflatten_field(result.T)
+        
+        if self.config.verbose:
+            print(f"  Tempo soluzione: {t_solve:.2f} s")
+            print(f"  Convergenza: {result.converged}")
+            if result.iterations > 0:
+                print(f"  Iterazioni: {result.iterations}")
+            print(f"  Residuo: {result.residual:.2e}")
+        
+        return result
+    
+    def _solve_direct(self) -> SolverResult:
+        """Risolve con metodo diretto (LU sparse)"""
+        try:
+            T = splinalg.spsolve(self._A, self._b)
+            
+            # Calcola residuo
+            residual = np.linalg.norm(self._A @ T - self._b)
+            
+            return SolverResult(
+                T=T,
+                converged=True,
+                iterations=0,
+                residual=residual,
+                solve_time=0.0,
+                info={'method': 'direct_spsolve'}
+            )
+        except Exception as e:
+            print(f"Errore solutore diretto: {e}")
+            return SolverResult(
+                T=np.zeros(self.mesh.N_total),
+                converged=False,
+                iterations=0,
+                residual=np.inf,
+                solve_time=0.0,
+                info={'error': str(e)}
+            )
+    
+    def _solve_iterative(self) -> SolverResult:
+        """Risolve con metodo iterativo"""
+        
+        # Costruisci precondizionatore
+        M = self._get_preconditioner()
+        
+        # Punto iniziale (temperatura corrente o uniforme)
+        x0 = self.mesh.T.ravel()
+        
+        # Callback per contare iterazioni
+        self._iter_count = 0
+        def callback(xk):
+            self._iter_count += 1
+        
+        # Seleziona metodo
+        method = self.config.method.lower()
+        
+        try:
+            if method == "cg":
+                # Conjugate Gradient (richiede matrice SPD)
+                T, info = splinalg.cg(
+                    self._A, self._b, x0=x0, M=M,
+                    tol=self.config.tolerance,
+                    maxiter=self.config.max_iterations,
+                    callback=callback
+                )
+            elif method == "gmres":
+                T, info = splinalg.gmres(
+                    self._A, self._b, x0=x0, M=M,
+                    rtol=self.config.tolerance,
+                    maxiter=self.config.max_iterations,
+                    callback=callback
+                )
+            elif method == "bicgstab":
+                T, info = splinalg.bicgstab(
+                    self._A, self._b, x0=x0, M=M,
+                    rtol=self.config.tolerance,
+                    maxiter=self.config.max_iterations,
+                    callback=callback
+                )
+            else:
+                raise ValueError(f"Metodo non supportato: {method}")
+            
+            # Calcola residuo
+            residual = np.linalg.norm(self._A @ T - self._b)
+            converged = (info == 0)
+            
+            return SolverResult(
+                T=T,
+                converged=converged,
+                iterations=self._iter_count,
+                residual=residual,
+                solve_time=0.0,
+                info={'method': method, 'info_code': info}
+            )
+            
+        except Exception as e:
+            print(f"Errore solutore iterativo: {e}")
+            return SolverResult(
+                T=x0,
+                converged=False,
+                iterations=self._iter_count,
+                residual=np.inf,
+                solve_time=0.0,
+                info={'error': str(e)}
+            )
+    
+    def _get_preconditioner(self) -> Optional[splinalg.LinearOperator]:
+        """Costruisce il precondizionatore"""
+        
+        prec_type = self.config.preconditioner.lower()
+        
+        if prec_type == "none":
+            return None
+            
+        elif prec_type == "jacobi":
+            # Precondizionatore diagonale (Jacobi)
+            diag = self._A.diagonal()
+            diag[np.abs(diag) < 1e-10] = 1.0  # Evita divisione per zero
+            M_inv = sparse.diags(1.0 / diag)
+            return M_inv
+            
+        elif prec_type == "ilu":
+            # Incomplete LU
+            try:
+                ilu = splinalg.spilu(self._A.tocsc())
+                M = splinalg.LinearOperator(
+                    self._A.shape, 
+                    matvec=ilu.solve
+                )
+                return M
+            except Exception as e:
+                print(f"Errore ILU, uso Jacobi: {e}")
+                return self._get_preconditioner_jacobi()
+        
+        else:
+            print(f"Precondizionatore non riconosciuto: {prec_type}")
+            return None
+    
+    def _get_preconditioner_jacobi(self):
+        """Fallback a Jacobi"""
+        diag = self._A.diagonal()
+        diag[np.abs(diag) < 1e-10] = 1.0
+        return sparse.diags(1.0 / diag)
+    
+    # =========================================================================
+    # METODI DI ANALISI
+    # =========================================================================
+    
+    def compute_residual(self, T: Optional[np.ndarray] = None) -> float:
+        """Calcola il residuo ||A*T - b||"""
+        if T is None:
+            T = self.mesh.T.ravel()
+        return np.linalg.norm(self._A @ T - self._b)
+    
+    def get_temperature_stats(self) -> Dict[str, float]:
+        """Restituisce statistiche sul campo di temperatura"""
+        T = self.mesh.T
+        return {
+            'T_min': float(T.min()),
+            'T_max': float(T.max()),
+            'T_mean': float(T.mean()),
+            'T_std': float(T.std()),
+        }
+    
+    def check_energy_balance(self) -> Dict[str, float]:
+        """
+        Verifica il bilancio energetico.
+        
+        Per caso stazionario: P_in = P_out
+        """
+        dx, dy, dz = self.mesh.dx, self.mesh.dy, self.mesh.dz
+        dV = dx * dy * dz
+        
+        # Potenza sorgenti interne
+        P_source = np.sum(self.mesh.Q) * dV  # [W]
+        
+        # Potenza uscente dai bordi (approssimata)
+        T = self.mesh.T
+        k = self.mesh.k
+        
+        # Flusso attraverso ogni faccia
+        # Faccia z_max
+        q_z_max = np.sum(self.mesh.bc_h[:, :, -1] * 
+                        (T[:, :, -1] - self.mesh.bc_T_inf[:, :, -1])) * dx * dy
+        
+        # Faccia z_min (conduzione verso terreno)
+        dT_dz = (T[:, :, 1] - T[:, :, 0]) / dz
+        q_z_min = np.sum(k[:, :, 0] * dT_dz) * dx * dy
+        
+        # Facce laterali x_min, x_max, y_min, y_max
+        q_x_min = np.sum(self.mesh.bc_h[0, :, :] * 
+                        (T[0, :, :] - self.mesh.bc_T_inf[0, :, :])) * dy * dz
+        q_x_max = np.sum(self.mesh.bc_h[-1, :, :] * 
+                        (T[-1, :, :] - self.mesh.bc_T_inf[-1, :, :])) * dy * dz
+        q_y_min = np.sum(self.mesh.bc_h[:, 0, :] * 
+                        (T[:, 0, :] - self.mesh.bc_T_inf[:, 0, :])) * dx * dz
+        q_y_max = np.sum(self.mesh.bc_h[:, -1, :] * 
+                        (T[:, -1, :] - self.mesh.bc_T_inf[:, -1, :])) * dx * dz
+        q_lateral = q_x_min + q_x_max + q_y_min + q_y_max
+        
+        P_out = q_z_max + q_z_min + q_lateral
+        
+        return {
+            'P_source_W': P_source,
+            'P_out_W': P_out,
+            'imbalance_W': P_source - P_out,
+            'imbalance_pct': 100 * abs(P_source - P_out) / max(abs(P_source), 1e-10)
+        }
+
+
+# =============================================================================
+# FUNZIONI DI UTILITÀ
+# =============================================================================
+
+def solve_steady_state(mesh: Mesh3D, 
+                       method: str = "direct",
+                       verbose: bool = True) -> SolverResult:
+    """
+    Funzione wrapper per risolvere rapidamente il caso stazionario.
+    
+    Args:
+        mesh: Mesh3D configurata
+        method: Metodo di soluzione
+        verbose: Stampa info
+        
+    Returns:
+        SolverResult
+    """
+    config = SolverConfig(method=method, verbose=verbose)
+    solver = SteadyStateSolver(mesh, config)
+    return solver.solve()
+
+
+# =============================================================================
+# TEST
+# =============================================================================
+if __name__ == "__main__":
+    from ..core.mesh import Mesh3D
+    from ..core.materials import MaterialManager
+    from ..core.geometry import create_small_test_geometry
+    
+    print("=" * 60)
+    print("TEST STEADY STATE SOLVER")
+    print("=" * 60)
+    
+    # Crea mesh
+    mesh = Mesh3D(Lx=6.0, Ly=6.0, Lz=5.0, Nx=30, Ny=30, Nz=25)
+    
+    # Applica geometria
+    mat_manager = MaterialManager()
+    geom = create_small_test_geometry()
+    geom.apply_to_mesh(mesh, mat_manager)
+    
+    print(f"\nMesh: {mesh.Nx}x{mesh.Ny}x{mesh.Nz} = {mesh.N_total} nodi")
+    print(f"Memoria stimata: {mesh._estimate_memory()/1e6:.1f} MB")
+    
+    # Test solutore diretto
+    print("\n--- Test Solutore Diretto ---")
+    result = solve_steady_state(mesh, method="direct")
+    
+    stats = SteadyStateSolver(mesh).get_temperature_stats()
+    print(f"\nStatistiche temperatura:")
+    for key, val in stats.items():
+        print(f"  {key}: {val:.1f} °C")
+    
+    # Test solutore iterativo
+    print("\n--- Test Solutore Iterativo (BiCGSTAB) ---")
+    config = SolverConfig(method="bicgstab", tolerance=1e-6, verbose=True)
+    solver = SteadyStateSolver(mesh, config)
+    result2 = solver.solve(rebuild=True)
+    
+    # Confronta soluzioni
+    if result.converged and result2.converged:
+        diff = np.abs(result.T - result2.T).max()
+        print(f"\nDifferenza max tra metodi: {diff:.2e} °C")
+    
+    print("\n" + "=" * 60)
+    print("TEST COMPLETATO")
+    print("=" * 60)
